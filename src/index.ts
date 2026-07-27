@@ -75,7 +75,12 @@ app.get("/health", (_req, res) => {
 });
 
 const routes = {
-  "POST /generate": {
+  // Wildcard verb ("* /generate", not "POST /generate") so the x402 gate
+  // fires on every HTTP method, not just POST — an unpaid request of any
+  // kind gets the 402 challenge before Express's own method routing (the
+  // app.all(...) 405 handler below) ever runs. Only POST is actually
+  // implemented; a paid non-POST request still hits that 405 afterward.
+  "* /generate": {
     accepts: acceptsFor(PRICE_BASE_UNITS.generate),
     description:
       "Tell it a precious memory and it generates keepsake art in Soulcanvas's house " +
