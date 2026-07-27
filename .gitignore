@@ -1,0 +1,11 @@
+node_modules/
+dist/
+data/
+.env
+
+# Foundry
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+contracts/lib/
+contracts/.minter.key
