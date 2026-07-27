@@ -18,7 +18,9 @@ const HOUSE_STYLE =
   "warm painterly hand-painted anime-style illustration, intricate background detail, " +
   "soft glowing lamplight or golden-hour light with visible light rays, rich textures on " +
   "fabric and surfaces, layered depth, peaceful nostalgic cinematic mood, warm color " +
-  "palette with deep shadows, expressive but grounded character faces";
+  "palette with deep shadows, expressive but grounded character faces. Do not depict any " +
+  "real brand names, logos, or trademarked product designs (e.g. a generic smartphone box, " +
+  "not a specific phone brand) — genuinely generic objects only.";
 
 export interface MemoryInput {
   story: string;

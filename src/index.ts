@@ -21,6 +21,12 @@ process.on("uncaughtException", (err) => console.error("uncaughtException:", err
 process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
 
 const app = express();
+// Railway terminates TLS at its edge and forwards plain HTTP internally —
+// without this, req.protocol always reads "http", so the tokenURI baked into
+// every mint would permanently point at an http:// URL and force a redirect
+// on every resolve. Verified: token 0 (first test mint) already has this bug
+// baked in immutably; this fix only applies to mints from here on.
+app.set("trust proxy", true);
 app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT ?? 3000;
