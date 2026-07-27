@@ -1,12 +1,12 @@
 // Soulcanvas: tell it a precious memory, it turns it into art, then mints it
 // as a soulbound NFT to your wallet on X Layer — so you can't lose it.
 //
-//   POST /generate  — x402-gated. Body: memory details. Generates the art,
-//                      returns { previewId, imageBase64Png }. Payment already
-//                      covers the eventual mint — /mint itself is free.
-//   POST /mint       — takes a previewId + recipient address, performs the
-//                      actual soulbound mint. Irreversible: only call this
-//                      after the buyer has seen the preview and confirmed.
+//   POST /generate  — x402-gated. Body: memory details + recipient wallet.
+//                      Generates the art, returns { previewId, imageBase64Png }.
+//                      Payment already covers the eventual mint — /mint is free.
+//   POST /mint       — takes a previewId, mints to the recipient locked in at
+//                      /generate time. Irreversible: only call this after the
+//                      buyer has seen the preview and confirmed.
 //   GET  /preview/:id — re-fetch a pending preview's image (convenience).
 
 import express from "express";
@@ -15,6 +15,7 @@ import { acceptsFor, initPayments, payerOf, PRICE_BASE_UNITS, resourceServer } f
 import { generateMemoryArt, type MemoryInput } from "./imagegen.js";
 import { mintMemory } from "./mint.js";
 import { PersistentMap } from "./persist.js";
+import { recordFailure } from "./refunds.js";
 import { randomUUID } from "node:crypto";
 
 process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
@@ -36,10 +37,13 @@ const PORT = process.env.PORT ?? 3000;
 // (same pattern as Renegade's charge-on-accept gap).
 interface PendingPreview {
   payer: string;
+  recipient: string;
   imageBase64Png: string;
   story: string;
   createdAt: number;
 }
+
+const EVM_ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
 const previews = new Map<string, PendingPreview>();
 const PREVIEW_TTL_MS = 30 * 60 * 1000; // 30 minutes
 
@@ -76,10 +80,12 @@ const routes = {
     description:
       "Tell it a precious memory and it generates keepsake art in Soulcanvas's house " +
       "style (warm painterly, richly detailed, nostalgic). Required JSON body: " +
-      '{ story: string (the memory, freeform), setting?: string, emotionalBeat?: string, ' +
-      "whoElsePresent?: string, specificDetail?: string }. Returns a preview — call " +
-      "POST /mint with the returned previewId to actually mint it as a soulbound NFT " +
-      "once you've confirmed you like it. Payment covers both the art and the eventual mint.",
+      '{ story: string (the memory, freeform), recipient: string (0x-prefixed EVM address ' +
+      "the soulbound NFT will be minted to — can be a different wallet than the one paying), " +
+      "setting?: string, emotionalBeat?: string, whoElsePresent?: string, specificDetail?: " +
+      "string }. Returns a preview — call POST /mint with the returned previewId to actually " +
+      "mint it once you've confirmed you like it. The recipient is locked in at this step and " +
+      "can't be changed at mint time. Payment covers both the art and the eventual mint.",
     mimeType: "application/json",
   },
 };
@@ -88,20 +94,32 @@ app.use(paymentMiddleware(routes, resourceServer));
 
 app.post("/generate", async (req, res) => {
   const startedAt = Date.now();
+  // Read outside the try so it's available in the catch block below — payment
+  // has already settled by the time this handler runs (middleware gates it),
+  // so a downstream failure here is a paid-but-undelivered case, not a
+  // rejected request.
+  let payer = "unknown";
   try {
-    const body = req.body as MemoryInput;
+    const body = req.body as MemoryInput & { recipient?: string };
     if (!body?.story || typeof body.story !== "string") {
       res.status(400).json({ error: "story is required (the memory, freeform text)" });
       return;
     }
+    if (!body.recipient || !EVM_ADDRESS_RE.test(body.recipient)) {
+      res.status(400).json({
+        error: "recipient is required — a valid 0x-prefixed EVM address the NFT will be minted to",
+      });
+      return;
+    }
 
-    const payer = payerOf(req);
+    payer = payerOf(req);
     const art = await generateMemoryArt(body);
 
     pruneExpiredPreviews();
     const previewId = randomUUID();
     previews.set(previewId, {
       payer,
+      recipient: body.recipient,
       imageBase64Png: art.base64Png,
       story: body.story,
       createdAt: Date.now(),
@@ -110,12 +128,21 @@ app.post("/generate", async (req, res) => {
     res.json({
       previewId,
       imageBase64Png: art.base64Png,
-      note: "Review the art, then POST /mint with this previewId and your wallet address to mint it as a soulbound NFT. This step is irreversible once minted.",
+      note: "Review the art, then POST /mint with this previewId to mint it as a soulbound NFT to the recipient you specified. This step is irreversible once minted.",
     });
     console.log(`[soulcanvas] generated in ${Date.now() - startedAt}ms, previewId=${previewId}`);
   } catch (err) {
+    const message = (err as Error).message;
     console.error(`[soulcanvas] generate failed after ${Date.now() - startedAt}ms:`, err);
-    res.status(500).json({ error: "generation failed", detail: (err as Error).message });
+    if (payer !== "unknown") {
+      recordFailure({
+        route: "generate",
+        payer,
+        amountBaseUnits: PRICE_BASE_UNITS.generate,
+        reason: message,
+      });
+    }
+    res.status(500).json({ error: "generation failed", detail: message });
   }
 });
 
@@ -132,13 +159,9 @@ app.get("/preview/:id", (req, res) => {
 app.post("/mint", async (req, res) => {
   const startedAt = Date.now();
   try {
-    const { previewId, recipient } = req.body as { previewId?: string; recipient?: string };
+    const { previewId } = req.body as { previewId?: string };
     if (!previewId || typeof previewId !== "string") {
       res.status(400).json({ error: "previewId is required" });
-      return;
-    }
-    if (!recipient || !/^0x[a-fA-F0-9]{40}$/.test(recipient)) {
-      res.status(400).json({ error: "recipient must be a valid 0x-prefixed EVM address" });
       return;
     }
 
@@ -148,6 +171,9 @@ app.post("/mint", async (req, res) => {
       res.status(404).json({ error: "preview not found or expired (30 min TTL) — call /generate again" });
       return;
     }
+    // recipient was locked in at /generate time — not re-accepted here, so a
+    // caller can't redirect an already-paid-for mint to a different wallet.
+    const recipient = preview.recipient;
 
     // Metadata JSON hosted by this same backend (v1 — see README limitations).
     // Written to durable storage BEFORE the mint call, so tokenURI can never
